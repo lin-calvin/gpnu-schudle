@@ -11,7 +11,7 @@
 ### 构建镜像
 
 ```bash
-git clone <repo> gpnu-schudle && cd gpnu-schudle
+git clone https://github.com/lin-calvin/gpnu-schudle.git && cd gpnu-schudle
 docker build -t gpnu-schudle .
 ```
 
