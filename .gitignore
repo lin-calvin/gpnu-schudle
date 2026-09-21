@@ -1,0 +1,10 @@
+# 构建产物
+/gpnu-schudle
+
+# 本地会话/凭据
+keys.json
+.env
+
+# Python
+__pycache__/
+*.pyc
