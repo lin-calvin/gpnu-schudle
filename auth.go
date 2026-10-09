@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net/http"
 	"net/http/cookiejar"
@@ -60,8 +61,10 @@ func (r *casLoginResponse) normalize() {
 
 type openAIResponse struct {
 	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
+		FinishReason string `json:"finish_reason"`
+		Message      struct {
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
 		} `json:"message"`
 	} `json:"choices"`
 	Error json.RawMessage `json:"error"`
@@ -287,7 +290,7 @@ func modelCaptchaAnswer(imageData string) (string, error) {
 			},
 		},
 		"temperature": 0,
-		"max_tokens":  64,
+		"max_tokens":  256,
 	}
 
 	body, err := json.Marshal(payload)
@@ -303,28 +306,69 @@ func modelCaptchaAnswer(imageData string) (string, error) {
 	req.Header.Set("HTTP-Referer", "https://jwglxt.gpnu.edu.cn")
 	req.Header.Set("X-Title", "GPNU timetable captcha")
 
+	started := time.Now()
 	resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
 	if err != nil {
+		log.Printf("captcha: model=%s request failed: %v", model, err)
 		return "", err
 	}
 	data, err := readAuthResponse(resp)
 	if err != nil {
 		return "", err
 	}
+	if resp.StatusCode != http.StatusOK {
+		snippet := strings.Join(strings.Fields(string(data)), " ")
+		if len(snippet) > 200 {
+			snippet = snippet[:200]
+		}
+		log.Printf("captcha: model=%s http=%d body=%s", model, resp.StatusCode, snippet)
+		return "", fmt.Errorf("模型返回 HTTP %d", resp.StatusCode)
+	}
 
 	var result openAIResponse
 	if err := json.Unmarshal(data, &result); err != nil {
+		snippet := strings.Join(strings.Fields(string(data)), " ")
+		if len(snippet) > 200 {
+			snippet = snippet[:200]
+		}
+		log.Printf("captcha: model=%s non-json response: %s", model, snippet)
 		return "", errors.New("模型返回非 JSON")
 	}
 	if len(result.Choices) == 0 {
+		log.Printf("captcha: model=%s no choices error=%s", model, string(result.Error))
 		return "", errors.New("模型暂不可用")
 	}
 
-	answer := strings.TrimSpace(result.Choices[0].Message.Content)
-	if !regexp.MustCompile(`^\d{1,3}$`).MatchString(answer) {
+	message := result.Choices[0].Message
+	answer := extractInteger(message.Content)
+	if answer == "" {
+		// 推理模型可能把答案放在 reasoning_content 里
+		answer = extractInteger(message.ReasoningContent)
+	}
+	if answer == "" {
+		log.Printf("captcha: model=%s no integer, finish=%s content=%q reasoning_tail=%q",
+			model, result.Choices[0].FinishReason, message.Content, tail(message.ReasoningContent, 120))
 		return "", errors.New("模型没有返回单独数字")
 	}
+	log.Printf("captcha: model=%s answered %s in %s", model, answer, time.Since(started).Round(time.Millisecond))
 	return answer, nil
+}
+
+// extractInteger 从文本里取一个 1~3 位整数（优先整体匹配）
+func extractInteger(s string) string {
+	s = strings.TrimSpace(s)
+	if regexp.MustCompile(`^\d{1,3}$`).MatchString(s) {
+		return s
+	}
+	m := regexp.MustCompile(`\d{1,3}`).FindString(s)
+	return m
+}
+
+func tail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }
 
 func casTicket(client *http.Client, modulus, exponent *big.Int, captcha casCaptcha, answer, username, password, service string) (casLoginResponse, error) {
@@ -374,6 +418,7 @@ func serviceTicket(client *http.Client, tgt, service string) (string, error) {
 	return value, nil
 }
 
+// visitService 手动逐跳跟随重定向并打日志，避免整链超时无法定位
 func visitService(client *http.Client, service, ticket string) error {
 	target, err := url.Parse(service)
 	if err != nil {
@@ -383,12 +428,41 @@ func visitService(client *http.Client, service, ticket string) error {
 	query.Set("ticket", ticket)
 	target.RawQuery = query.Encode()
 
-	resp, err := client.Get(target.String())
-	if err != nil {
-		return err
+	hopClient := *client
+	hopClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
-	_, err = readAuthResponse(resp)
-	return err
+
+	current := target.String()
+	for hop := 0; hop < 12; hop++ {
+		req, err := http.NewRequest(http.MethodGet, current, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("User-Agent", userAgent)
+		started := time.Now()
+		resp, err := hopClient.Do(req)
+		if err != nil {
+			log.Printf("sso: hop %d GET %s failed after %s: %v", hop, current, time.Since(started).Round(time.Millisecond), err)
+			return err
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+
+		loc := resp.Header.Get("Location")
+		log.Printf("sso: hop %d code=%d in %s set-cookie=%v loc=%s",
+			hop, resp.StatusCode, time.Since(started).Round(time.Millisecond), resp.Header.Values("Set-Cookie"), loc)
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 && loc != "" {
+			next, err := resp.Request.URL.Parse(loc)
+			if err != nil {
+				return err
+			}
+			current = next.String()
+			continue
+		}
+		return nil
+	}
+	return nil
 }
 
 func loginWithoutBrowser() (*keysFile, error) {
@@ -396,10 +470,12 @@ func loginWithoutBrowser() (*keysFile, error) {
 }
 
 func loginWithCredentials(username, password string) (*keysFile, error) {
+	started := time.Now()
 	client, jar, err := newAuthClient()
 	if err != nil {
 		return nil, err
 	}
+	log.Printf("login: start user=%s", username)
 
 	resp, err := client.Get(casBase + "/lyuapServer/login?service=" + url.QueryEscape(portalService))
 	if err != nil {
@@ -441,28 +517,35 @@ func loginWithCredentials(username, password string) (*keysFile, error) {
 		answer, err := modelCaptchaAnswer(captcha.Content)
 		if err != nil {
 			lastError = err.Error()
+			log.Printf("login: user=%s attempt %d captcha solving failed: %v", username, attempt, err)
 			continue
 		}
 
 		login, err = casTicket(client, modulus, exponent, captcha, answer, username, password, portalService)
 		if err != nil {
 			lastError = err.Error()
+			log.Printf("login: user=%s attempt %d ticket request failed: %v", username, attempt, err)
 			continue
 		}
 		if login.Data.Code == "CODEFALSE" {
 			lastError = "验证码错误"
+			log.Printf("login: user=%s attempt %d captcha wrong (answer=%s)", username, attempt, answer)
 			continue
 		}
 		if login.Data.Code == "PASSERROR" || login.Data.Code == "NOUSER" {
+			log.Printf("login: user=%s auth failed: %s", username, login.Data.Code)
 			return nil, fmt.Errorf("%w: %s", errAuthFailed, login.Data.Code)
 		}
 		if login.Data.TGT == "" || login.Data.Ticket == "" {
 			lastError = login.Data.Code
+			log.Printf("login: user=%s attempt %d unexpected code=%s", username, attempt, login.Data.Code)
 			continue
 		}
+		log.Printf("login: user=%s attempt %d ok, got ticket in %s", username, attempt, time.Since(started).Round(time.Millisecond))
 		break
 	}
 	if login.Data.TGT == "" || login.Data.Ticket == "" {
+		log.Printf("login: user=%s failed after retries: %s", username, lastError)
 		return nil, fmt.Errorf("CAS 登录失败(最多5次): %s", lastError)
 	}
 
@@ -482,8 +565,10 @@ func loginWithCredentials(username, password string) (*keysFile, error) {
 	portalCookie := cookieHeader(jar.Cookies(portalURL))
 	jwglxtCookie := cookieHeader(jar.Cookies(jwglxtURL))
 	if portalCookie == "" || jwglxtCookie == "" {
+		log.Printf("login: user=%s sso ok but missing cookies", username)
 		return nil, errors.New("SSO 成功但没有拿到目标站 Cookie")
 	}
+	log.Printf("login: user=%s done in %s", username, time.Since(started).Round(time.Millisecond))
 	return &keysFile{Cookies: map[string]string{
 		"portal": portalCookie,
 		"jwglxt": jwglxtCookie,

@@ -551,6 +551,7 @@ func main() {
 	mux.HandleFunc("/ics", icsHandler(*keysPath))
 	mux.HandleFunc("/api/ics", icsHandler(*keysPath))
 
-	log.Printf("gpnu-schudle listening on %s (keys=%s)", *addr, *keysPath)
+	log.Printf("gpnu-schudle listening on %s (keys=%s, captcha endpoint=%s model=%s)",
+		*addr, *keysPath, openAIEndpoint(), os.Getenv("OPENAI_MODEL"))
 	log.Fatal(http.ListenAndServe(*addr, mux))
 }
