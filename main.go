@@ -347,15 +347,15 @@ func configuredTermStart() (time.Time, bool) {
 	return time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, cst), true
 }
 
-func weekForDate(pr *portalResp, date time.Time) int {
+func computeWeek(zs string, date time.Time) int {
 	if start, ok := configuredTermStart(); ok {
-		current := time.Date(date.In(cst).Year(), date.In(cst).Month(), date.In(cst).Day(), 0, 0, 0, 0, cst)
-		weeks := int(current.Sub(start).Hours() / (24 * 7))
-		if weeks >= 0 {
+		local := date.In(cst)
+		current := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, cst)
+		if weeks := int(current.Sub(start).Hours() / (24 * 7)); weeks >= 0 {
 			return weeks + 1
 		}
 	}
-	week, _ := strconv.Atoi(pr.Data.ZS)
+	week, _ := strconv.Atoi(zs)
 	if week < 1 {
 		return 1
 	}
@@ -394,35 +394,24 @@ func withKeysRetry(keysPath string, fn func(*keysFile) (any, error)) (any, error
 
 func makeTodayHandler(keysPath string) apiFn {
 	return func(q url.Values) (any, error) {
-		return withKeysRetry(keysPath, func(keys *keysFile) (any, error) {
-			return buildToday(keys, q)
-		})
+		data, err := scheduleForEnv(keysPath)
+		if err != nil {
+			return nil, err
+		}
+		return renderToday(data, q), nil
 	}
 }
 
-func buildToday(keys *keysFile, q url.Values) (any, error) {
-	pr, err := getPortalWeek(keys)
-	if err != nil {
-		return nil, err
-	}
-	xq, _ := strconv.Atoi(pr.Data.XQ)
-	weekCount, _ := strconv.Atoi(pr.Data.WeekCount)
-
+func renderToday(data *scheduleData, q url.Values) TodayResp {
 	day := nowCST()
 	if s := q.Get("date"); s != "" {
 		if t, err := time.ParseInLocation("2006-01-02", s, cst); err == nil {
 			day = t
 		}
 	}
-	week := weekForDate(pr, day)
+	week := computeWeek(data.zs, day)
 	wd := jwWeekday(day)
-
-	kb, err := getSchedule(keys, pr.Data.XN, xqmOf(xq))
-	if err != nil {
-		return nil, err
-	}
-	times, _ := getTimes(keys, pr.Data.XN, xqmOf(xq))
-	byDay := parseCourses(kb, times, week)
+	byDay := parseCourses(data.kb, data.times, week)
 
 	resp := TodayResp{
 		OK: true, Date: day.Format("2006-01-02"), Weekday: wd,
@@ -430,48 +419,40 @@ func buildToday(keys *keysFile, q url.Values) (any, error) {
 		IsToday: day.Format("2006-01-02") == nowCST().Format("2006-01-02"),
 		Classes: byDay[wd],
 	}
-	resp.Student.ID = kb.Xsxx.XH
-	resp.Student.Name = kb.Xsxx.XM
-	resp.Student.Class = kb.Xsxx.BJMC
-	resp.Term.XN = pr.Data.XN
-	resp.Term.XQ = xq
-	resp.Term.Name = pr.Data.XN + " 第" + strconv.Itoa(xq) + "学期"
-	resp.Term.WeekCount = weekCount
+	resp.Student.ID = data.kb.Xsxx.XH
+	resp.Student.Name = data.kb.Xsxx.XM
+	resp.Student.Class = data.kb.Xsxx.BJMC
+	resp.Term.XN = data.xn
+	resp.Term.XQ = data.xq
+	resp.Term.Name = data.xn + " 第" + strconv.Itoa(data.xq) + "学期"
+	resp.Term.WeekCount = data.weekCount
 	if resp.Classes == nil {
 		resp.Classes = []Class{}
 	}
-	return resp, nil
+	return resp
 }
 
 func makeWeekHandler(keysPath string) apiFn {
 	return func(q url.Values) (any, error) {
-		return withKeysRetry(keysPath, func(keys *keysFile) (any, error) {
-			return buildWeek(keys, q)
-		})
+		data, err := scheduleForEnv(keysPath)
+		if err != nil {
+			return nil, err
+		}
+		return renderWeek(data, q), nil
 	}
 }
 
-func buildWeek(keys *keysFile, q url.Values) (any, error) {
-	pr, err := getPortalWeek(keys)
-	if err != nil {
-		return nil, err
-	}
-	xq, _ := strconv.Atoi(pr.Data.XQ)
-	week := weekForDate(pr, nowCST())
+func renderWeek(data *scheduleData, q url.Values) WeekResp {
+	week := computeWeek(data.zs, nowCST())
 	if s := q.Get("week"); s != "" {
 		if n, err := strconv.Atoi(s); err == nil {
 			week = n
 		}
 	}
-	kb, err := getSchedule(keys, pr.Data.XN, xqmOf(xq))
-	if err != nil {
-		return nil, err
-	}
-	times, _ := getTimes(keys, pr.Data.XN, xqmOf(xq))
-	byDay := parseCourses(kb, times, week)
+	byDay := parseCourses(data.kb, data.times, week)
 
 	resp := WeekResp{OK: true, Week: week,
-		Term: pr.Data.XN + " 第" + strconv.Itoa(xq) + "学期"}
+		Term: data.xn + " 第" + strconv.Itoa(data.xq) + "学期"}
 	for wd := 1; wd <= 7; wd++ {
 		cs := byDay[wd]
 		if cs == nil {
@@ -479,7 +460,7 @@ func buildWeek(keys *keysFile, q url.Values) (any, error) {
 		}
 		resp.Days = append(resp.Days, Day{Weekday: wd, Name: weekdayName(wd), Classes: cs})
 	}
-	return resp, nil
+	return resp
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

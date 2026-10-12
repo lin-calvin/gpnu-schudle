@@ -63,32 +63,16 @@ func termStart(week, weekday int) time.Time {
 	return today.AddDate(0, 0, -((week-1)*7 + (weekday - 1)))
 }
 
-func buildICS(keys *keysFile) (string, error) {
-	pr, err := getPortalWeek(keys)
-	if err != nil {
-		return "", err
-	}
-	xq, _ := strconv.Atoi(pr.Data.XQ)
-	week := weekForDate(pr, nowCST())
+func buildICSFromData(data *scheduleData) string {
+	week := computeWeek(data.zs, nowCST())
 	if week < 1 {
 		week = 1
 	}
-	weekCount, _ := strconv.Atoi(pr.Data.WeekCount)
+	weekCount := data.weekCount
 	if weekCount < 1 {
 		weekCount = 18
 	}
-	wd, _ := strconv.Atoi(pr.Data.XQJ)
-	if wd < 1 || wd > 7 {
-		wd = 1
-	}
-
-	kb, err := getSchedule(keys, pr.Data.XN, xqmOf(xq))
-	if err != nil {
-		return "", err
-	}
-	times, _ := getTimes(keys, pr.Data.XN, xqmOf(xq))
-
-	start := termStart(week, wd)
+	start := icsTermStart(week, data.xqj)
 	nowStamp := time.Now().In(cst).UTC().Format("20060102T150405Z")
 
 	var b strings.Builder
@@ -100,14 +84,14 @@ func buildICS(keys *keysFile) (string, error) {
 	b.WriteString("X-WR-CALNAME:广技师课表\r\n")
 	b.WriteString("X-WR-TIMEZONE:Asia/Shanghai\r\n")
 
-	for _, k := range kb.KbList {
+	for _, k := range data.kb.KbList {
 		xqj, err := strconv.Atoi(k.XQJ)
 		if err != nil || xqj < 1 || xqj > 7 {
 			continue
 		}
 		a, z := periodRange(k.JC)
-		ts, ok1 := times[a]
-		te, ok2 := times[z]
+		ts, ok1 := data.times[a]
+		te, ok2 := data.times[z]
 		if !ok1 || !ok2 {
 			continue
 		}
@@ -155,19 +139,25 @@ func buildICS(keys *keysFile) (string, error) {
 	}
 
 	b.WriteString("END:VCALENDAR\r\n")
-	return b.String(), nil
+	return b.String()
+}
+
+// icsTermStart 优先用配置的学期起始日，否则退回门户周次反推
+func icsTermStart(week, xqj int) time.Time {
+	if start, ok := configuredTermStart(); ok {
+		return start
+	}
+	return termStart(week, xqj)
 }
 
 func icsHandler(keysPath string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		result, err := withKeysRetry(keysPath, func(keys *keysFile) (any, error) {
-			return buildICS(keys)
-		})
+		data, err := scheduleForEnv(keysPath)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		ics, _ := result.(string)
+		ics := buildICSFromData(data)
 		w.Header().Set("Content-Type", "text/calendar; charset=utf-8")
 		w.Header().Set("Content-Disposition", `inline; filename="gpnu.ics"`)
 		w.Header().Set("Cache-Control", "no-cache")

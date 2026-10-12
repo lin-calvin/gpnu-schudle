@@ -32,44 +32,41 @@ func caldavETag(ics string) string {
 	return `"` + hex.EncodeToString(sum[:]) + `"`
 }
 
-// caldavKeys 返回本次请求要用的会话；public 模式下还返回学号密码用于失效重登
-func caldavKeys(keysPath string, r *http.Request) (*keysFile, string, string, error) {
+// caldavSchedule 返回该请求对应的课表数据（12h/午夜缓存，命中即免登录）
+func caldavSchedule(keysPath string, r *http.Request) (*scheduleData, error) {
 	if !caldavPublic() {
-		result, err := withKeysRetry(keysPath, func(keys *keysFile) (any, error) {
-			return keys, nil
-		})
-		if err != nil {
-			return nil, "", "", err
-		}
-		keys, _ := result.(*keysFile)
-		return keys, "", "", nil
+		return scheduleForEnv(keysPath)
 	}
 
 	username, password, ok := r.BasicAuth()
 	if !ok || username == "" {
-		return nil, "", "", errAuthFailed
+		return nil, errAuthFailed
 	}
+	key := sessionKey(username, password)
+	if data, ok := cacheGet(key); ok {
+		return data, nil
+	}
+
 	keys, err := sessionForCredentials(username, password)
 	if err != nil {
-		return nil, "", "", err
+		return nil, err
 	}
-	return keys, username, password, nil
-}
-
-func caldavICS(keys *keysFile, username, password string) (string, string, error) {
-	ics, err := buildICS(keys)
-	if err != nil && caldavPublic() && username != "" {
-		// 缓存的会话可能已失效，清掉后用同一凭据重新登录一次
+	data, err := fetchSchedule(keys)
+	if err != nil {
+		// 会话可能已失效：清缓存后用同一凭据重登一次
 		invalidateUserSession(username, password)
-		fresh, loginErr := sessionForCredentials(username, password)
-		if loginErr == nil {
-			ics, err = buildICS(fresh)
+		cacheInvalidate(key)
+		keys, err = sessionForCredentials(username, password)
+		if err != nil {
+			return nil, err
+		}
+		data, err = fetchSchedule(keys)
+		if err != nil {
+			return nil, err
 		}
 	}
-	if err != nil {
-		return "", "", err
-	}
-	return ics, caldavETag(ics), nil
+	cachePut(key, data)
+	return data, nil
 }
 
 func caldavHandler(keysPath string) http.HandlerFunc {
@@ -82,7 +79,7 @@ func caldavHandler(keysPath string) http.HandlerFunc {
 			return
 		}
 
-		keys, username, password, err := caldavKeys(keysPath, r)
+		data, err := caldavSchedule(keysPath, r)
 		if err != nil {
 			if errors.Is(err, errAuthFailed) {
 				w.Header().Set("WWW-Authenticate", `Basic realm="gpnu-timetable"`)
@@ -92,11 +89,8 @@ func caldavHandler(keysPath string) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		ics, etag, err := caldavICS(keys, username, password)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
+		ics := buildICSFromData(data)
+		etag := caldavETag(ics)
 
 		switch r.Method {
 		case http.MethodGet, http.MethodHead:
