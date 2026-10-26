@@ -3,9 +3,11 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -63,6 +65,89 @@ func termStart(week, weekday int) time.Time {
 	return today.AddDate(0, 0, -((week-1)*7 + (weekday - 1)))
 }
 
+var (
+	// 去掉 “(白云)” “（白云校区）” 这类校区标注
+	campusParenRe  = regexp.MustCompile(`[（(][^（()）]*(?:校区|白云|大学城|本部)[^（()）]*[）)]`)
+	campusPrefixRe = regexp.MustCompile(`^[\p{Han}]{0,4}校区`)
+	roomTailRe     = regexp.MustCompile(`^(.*?)([A-Za-z]?\d{1,4}[A-Za-z]?)$`)
+)
+
+// cleanLocation 去掉校区标注、空白、结尾“室”
+func cleanLocation(loc string) string {
+	s := strings.TrimSpace(loc)
+	if s == "" {
+		return ""
+	}
+	s = campusParenRe.ReplaceAllString(s, "")
+	s = campusPrefixRe.ReplaceAllString(s, "")
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\u3000', '\t', '\n', '\r':
+			return -1
+		}
+		return r
+	}, s)
+	return strings.TrimSuffix(s, "室")
+}
+
+// classroomTag 从场地名中提取「教学楼+门牌号」，如 "一教503(白云)" -> "一教503"。
+// 校区信息一律丢弃；无法可靠识别时返回空串（静默失败）。
+func classroomTag(loc string) string {
+	s := cleanLocation(loc)
+	if s == "" {
+		return ""
+	}
+
+	m := roomTailRe.FindStringSubmatch(s)
+	if m == nil || m[2] == "" {
+		return ""
+	}
+	building := strings.Trim(m[1], "-－—–_")
+	if building != "" {
+		if utf8.RuneCountInString(building) > 12 {
+			return ""
+		}
+		// 楼名至少含一个文字（汉字/字母），排除纯符号噪声
+		if !strings.ContainsFunc(building, unicode.IsLetter) {
+			return ""
+		}
+	}
+	return s
+}
+
+// buildingName 从楼号中取出纯楼名（去掉房号与校区）
+func buildingName(loc string) string {
+	s := cleanLocation(loc)
+	if s == "" {
+		return ""
+	}
+	if m := roomTailRe.FindStringSubmatch(s); m != nil && m[2] != "" {
+		s = strings.Trim(m[1], "-－—–_")
+	}
+	if s == "" || utf8.RuneCountInString(s) > 12 {
+		return ""
+	}
+	if !strings.ContainsFunc(s, unicode.IsLetter) {
+		return ""
+	}
+	return s
+}
+
+// classroomTagOf 优先用场地名；若场地名只有房号，则用楼号补全
+func classroomTagOf(k kbItem) string {
+	tag := classroomTag(k.CDMC)
+	if tag == "" {
+		return ""
+	}
+	if r, _ := utf8.DecodeRuneInString(tag); !unicode.IsDigit(r) {
+		return tag
+	}
+	if building := buildingName(k.LH); building != "" {
+		return building + tag
+	}
+	return tag
+}
+
 func buildICSFromData(data *scheduleData) string {
 	week := computeWeek(data.zs, nowCST())
 	if week < 1 {
@@ -115,9 +200,9 @@ func buildICSFromData(data *scheduleData) string {
 				continue
 			}
 			uid := fmt.Sprintf("%s-%s-%02d%02d@gpnu-schudle", k.KCH, d.Format("20060102"), sh, sm)
-			sum := k.KCMC
-			if k.XSLXBJ != "" {
-				sum += strings.TrimSpace(k.XSLXBJ)
+			sum := strings.TrimSpace(k.KCMC)
+			if tag := classroomTagOf(k); tag != "" {
+				sum += " " + tag
 			}
 			loc := k.CDMC
 			if k.LH != "" && !strings.Contains(loc, strings.TrimSuffix(k.LH, "（白云校区）")) {
