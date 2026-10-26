@@ -204,9 +204,12 @@ func buildICSFromData(data *scheduleData) string {
 			if tag := classroomTagOf(k); tag != "" {
 				sum += " " + tag
 			}
-			loc := k.CDMC
-			if k.LH != "" && !strings.Contains(loc, strings.TrimSuffix(k.LH, "（白云校区）")) {
-				loc = k.LH + " " + loc
+			loc := classroomTagOf(k)
+			if loc == "" {
+				loc = cleanLocation(k.CDMC)
+			}
+			if loc == "" {
+				loc = k.CDMC
 			}
 			desc := fmt.Sprintf("教师: %s\\n教学班: %s\\n周次: %s\\n学分: %s",
 				icsEscape(k.XM), icsEscape(k.JXBMC), icsEscape(k.ZCD), icsEscape(k.XF))
