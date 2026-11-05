@@ -26,10 +26,13 @@ const (
 	casBase       = "https://cas.gpnu.edu.cn"
 	portalService = "https://portal.gpnu.edu.cn/shiro-cas"
 	jwglxtService = "https://jwglxt.gpnu.edu.cn/sso/lyiotlogin"
-	casAppJS      = casBase + "/assets/js/app.523338dac63532ba3269.js"
-	openAIBaseURL = "https://openrouter.ai/api/v1"
-	defaultModel  = "inclusionai/ling-3.0-flash-vl:free"
-	userAgent     = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/132 Safari/537.36"
+	// 2026-11 起门户/教务 SSO 多一层 webauth：落到 wengine 登录页后，
+	// 需再用 CAS TGT 给 webauth 换一张票才会继续跳回业务站
+	webauthCASService = "https://webauth.gpnu.edu.cn/wengine-auth/login?cas_login=true"
+	casAppJS          = casBase + "/assets/js/app.523338dac63532ba3269.js"
+	openAIBaseURL     = "https://openrouter.ai/api/v1"
+	defaultModel      = "inclusionai/ling-3.0-flash-vl:free"
+	userAgent         = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/132 Safari/537.36"
 )
 
 type casCaptcha struct {
@@ -419,7 +422,7 @@ func serviceTicket(client *http.Client, tgt, service string) (string, error) {
 }
 
 // visitService 手动逐跳跟随重定向并打日志，避免整链超时无法定位
-func visitService(client *http.Client, service, ticket string) error {
+func visitService(client *http.Client, service, ticket, tgt string) error {
 	target, err := url.Parse(service)
 	if err != nil {
 		return err
@@ -434,7 +437,8 @@ func visitService(client *http.Client, service, ticket string) error {
 	}
 
 	current := target.String()
-	for hop := 0; hop < 12; hop++ {
+	webAuthed := false
+	for hop := 0; hop < 16; hop++ {
 		req, err := http.NewRequest(http.MethodGet, current, nil)
 		if err != nil {
 			return err
@@ -460,9 +464,25 @@ func visitService(client *http.Client, service, ticket string) error {
 			current = next.String()
 			continue
 		}
+		// 停在 wengine 登录页：用 TGT 给 webauth 换票，再继续跟
+		if !webAuthed && isWebauthLogin(resp.Request.URL) {
+			webAuthed = true
+			webTicket, err := serviceTicket(client, tgt, webauthCASService)
+			if err != nil {
+				log.Printf("sso: webauth CAS ticket failed: %v", err)
+				return err
+			}
+			log.Printf("sso: webauth CAS hop ok, ticket=%s", webTicket)
+			current = webauthCASService + "&ticket=" + url.QueryEscape(webTicket)
+			continue
+		}
 		return nil
 	}
 	return nil
+}
+
+func isWebauthLogin(u *url.URL) bool {
+	return u != nil && u.Host == "webauth.gpnu.edu.cn" && strings.HasPrefix(u.Path, "/wengine-auth/login")
 }
 
 func loginWithoutBrowser() (*keysFile, error) {
@@ -549,14 +569,14 @@ func loginWithCredentials(username, password string) (*keysFile, error) {
 		return nil, fmt.Errorf("CAS 登录失败(最多5次): %s", lastError)
 	}
 
-	if err := visitService(client, portalService, login.Data.Ticket); err != nil {
+	if err := visitService(client, portalService, login.Data.Ticket, login.Data.TGT); err != nil {
 		return nil, err
 	}
 	jwTicket, err := serviceTicket(client, login.Data.TGT, jwglxtService)
 	if err != nil {
 		return nil, err
 	}
-	if err := visitService(client, jwglxtService, jwTicket); err != nil {
+	if err := visitService(client, jwglxtService, jwTicket, login.Data.TGT); err != nil {
 		return nil, err
 	}
 
