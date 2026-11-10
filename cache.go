@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"strconv"
 	"sync"
 	"time"
@@ -51,11 +52,25 @@ func cacheGet(key string) (*scheduleData, bool) {
 		return nil, false
 	}
 	if nowCST().After(entry.expiry) {
-		delete(scheduleCache.m, key)
+		// 不删：留作刷新失败时的兜底（见 cacheGetStale）
 		return nil, false
 	}
 	entry.lastUsed = time.Now()
 	scheduleCache.m[key] = entry
+	return entry.data, true
+}
+
+// staleGrace 刷新失败时，过期数据最多再兜底多久
+const staleGrace = 3 * 24 * time.Hour
+
+// cacheGetStale 取已过期但仍在宽限期内的数据，用于上游故障时兜底
+func cacheGetStale(key string) (*scheduleData, bool) {
+	scheduleCache.Lock()
+	defer scheduleCache.Unlock()
+	entry, ok := scheduleCache.m[key]
+	if !ok || nowCST().Sub(entry.expiry) > staleGrace {
+		return nil, false
+	}
 	return entry.data, true
 }
 
@@ -112,7 +127,12 @@ func fetchSchedule(keys *keysFile) (*scheduleData, error) {
 	if err != nil {
 		return nil, err
 	}
-	times, _ := getTimes(keys, pr.Data.XN, xqm)
+	times, err := getTimes(keys, pr.Data.XN, xqm)
+	if err != nil {
+		// 节次时间拿不到时直接失败：绝不能把空时间表写进 12h 缓存，
+		// 否则后续 ICS 会静默变成 0 个事件
+		return nil, err
+	}
 	weekCount, _ := strconv.Atoi(pr.Data.WeekCount)
 	if weekCount < 1 {
 		weekCount = 18
@@ -144,6 +164,11 @@ func scheduleForEnv(keysPath string) (*scheduleData, error) {
 		return nil, nil
 	})
 	if err != nil {
+		// 上游暂时故障时，用最多 3 天前的旧数据兜底，避免日历直接变空
+		if stale, ok := cacheGetStale(key); ok {
+			log.Printf("cache: refresh failed (%v), serving stale data", err)
+			return stale, nil
+		}
 		return nil, err
 	}
 	cachePut(key, data)

@@ -222,17 +222,27 @@ func getTimes(keys *keysFile, xn, xqm string) (map[int][2]string, error) {
 	form.Set("xqh_id", campusID)
 	body, err := postForm(rjcURL, keys.Cookies["jwglxt"], form)
 	if err != nil {
+		log.Printf("times: request failed: %v", err)
 		return nil, err
 	}
 	var items []rjcItem
 	if err := json.Unmarshal(body, &items); err != nil {
-		return nil, nil // 时间拿不到不致命
+		snippet := strings.Join(strings.Fields(string(body)), " ")
+		if len(snippet) > 160 {
+			snippet = snippet[:160]
+		}
+		log.Printf("times: non-json response: %s", snippet)
+		return nil, errors.New("节次时间表返回非 JSON")
 	}
 	m := map[int][2]string{}
 	for _, it := range items {
 		if n, err := strconv.Atoi(strings.TrimSpace(it.JCMC)); err == nil {
 			m[n] = [2]string{it.QSSJ, it.JSSJ}
 		}
+	}
+	if len(m) == 0 {
+		log.Printf("times: empty timetable (xn=%s xqm=%s xqh=%s)", xn, xqm, campusID)
+		return nil, errors.New("节次时间表为空")
 	}
 	return m, nil
 }

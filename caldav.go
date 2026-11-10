@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -57,11 +58,14 @@ func caldavSchedule(keysPath string, r *http.Request) (*scheduleData, error) {
 		invalidateUserSession(username, password)
 		cacheInvalidate(key)
 		keys, err = sessionForCredentials(username, password)
-		if err != nil {
-			return nil, err
+		if err == nil {
+			data, err = fetchSchedule(keys)
 		}
-		data, err = fetchSchedule(keys)
 		if err != nil {
+			if stale, ok := cacheGetStale(key); ok {
+				log.Printf("cache: caldav refresh failed (%v), serving stale data", err)
+				return stale, nil
+			}
 			return nil, err
 		}
 	}
